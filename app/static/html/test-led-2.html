@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>VLC OOK 解碼（邊緣鎖相位 + 最近邊緣面板｜斜率邊緣｜固定中心 ROI）</title>
+<style>
+  :root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, sans-serif; }
+  body { max-width: 960px; margin: 24px auto; padding: 0 16px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  video, canvas { max-width: 100%; border-radius: 12px; }
+  .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; }
+  label { font-size: 14px; color:#374151; }
+  input, select, button { padding: 8px 10px; border-radius: 10px; border:1px solid #cbd5e1; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #overlay { position:absolute; inset:0; pointer-events:none; } /* 固定 ROI → 不可拖拉 */
+  .stack { display:grid; }
+  small { color:#6b7280; }
+  /* 邊緣列表表格 */
+  #edgeList .hdr { color:#6b7280; }
+  #edgeList .row { display:grid; grid-template-columns: 42px 110px 90px 50px 1fr; gap:6px; align-items: baseline; }
+  #edgeList .row:not(.hdr) { border-top: 1px dashed #e5e7eb; padding-top: 4px; }
+</style>
+</head>
+<body>
+<h1>可見光 OOK 解碼（2 Hz / 8-bit / 邊緣鎖相位 / 嚴格 preamble / 斜率邊緣 / 固定中心 ROI）</h1>
+
+<div class="card">
+  <div class="row">
+    <label>鏡頭：</label>
+    <select id="camera"></select>
+    <label>符元率 (Hz)：</label>
+    <input id="symRate" type="number" min="0.1" step="0.1" value="2">
+    <label><input id="autoRate" type="checkbox"> 自動估計符元期</label>
+    <button id="start">啟動相機</button>
+    <button id="stop" disabled>停止</button>
+  </div>
+  <div class="row" style="margin-top:8px;">
+    <small>提示：HTTPS 或 localhost 才能取相機。此版本 ROI 固定在畫面中心 150×150 像素。</small>
+  </div>
+</div>
+
+<div class="row" style="margin-top:16px;">
+  <div class="stack" style="position:relative;flex:1;min-width:280px;">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <canvas id="canvas" class="card" width="320" height="240" hidden></canvas>
+</div>
+
+<div class="card" style="margin-top:12px;">
+  <div class="row"><label>訊號視覺化（亮度、門檻與邊緣 0→1 / 1→0）</label></div>
+  <canvas id="scope" width="900" height="180"></canvas>
+</div>
+
+<div class="card" style="margin-top:12px;">
+  <div class="row" style="flex:1;">
+    <div style="flex:1;min-width:260px">
+      <div><b>Preamble：</b> <span class="mono" id="preambleView">10101010</span></div>
+      <div><b>Payload bits：</b> <span class="mono" id="payloadBitsView">8</span></div>
+      <div><b>位元串：</b> <span id="bits" class="mono"></span></div>
+      <div><b>十六進位：</b> <span id="hex" class="mono"></span></div>
+      <div><b>ASCII：</b> <span id="ascii" class="mono"></span></div>
+      <div><b>診斷：</b> <span id="diag" class="mono"></span></div>
+    </div>
+  </div>
+</div>
+
+<!-- 最近 N 個邊緣面板 -->
+<div class="card" style="margin-top:12px;">
+  <div class="row" style="align-items:center;">
+    <b>最近邊緣（▲ 0→1 / ▼ 1→0）</b>
+    <span class="mono">顯示</span>
+    <input id="edgeCount" type="number" min="1" max="200" value="12" style="width:80px" />
+    <span class="mono">個</span>
+    <button id="clearLock" title="清除鎖定的 t0（下次將依邊緣重新鎖定）">解鎖</button>
+  </div>
+  <div id="edgeList" class="mono" style="margin-top:8px;"></div>
+</div>
+
+<script>
+// ====== 參數 ======
+const PREAMBLE_BITS = '10101010';
+const PAYLOAD_BITS  = 8;                   // 只解析 8 bits
+const EXTRA_SEARCH_BITS = 8;               // 額外取樣位元，讓 preamble 可在視窗內搜尋
+
+// ★ 斜率邊緣偵測參數（你的設定）
+const SLOPE_HI = 0.4;                      // 上升緣觸發門檻（亮度/秒）
+const SLOPE_LO = -0.4;                     // 下降緣觸發門檻（亮度/秒）
+const SLOPE_REFRACTORY = 0.1;              // 不應期（秒）避免重複觸發
+
+// ★ 固定中心 ROI（單位：來源影像像素）
+const USE_FIXED_ROI = true;
+const FIXED_ROI_PX = 150;
+// ===================
+
+// ====== 鎖相位：全域狀態 ======
+let lockedT0 = null;  // 鎖定後的「位元 0 邊界」絕對時間
+let failCount = 0;    // 連續解碼失敗次數（自動解鎖用）
+const mod = (x,m) => ((x % m) + m) % m;
+
+const els = {
+  camera: document.getElementById('camera'),
+  start: document.getElementById('start'),
+  stop: document.getElementById('stop'),
+  video: document.getElementById('video'),
+  overlay: document.getElementById('overlay'),
+  canvas: document.getElementById('canvas'),
+  scope: document.getElementById('scope'),
+  symRate: document.getElementById('symRate'),
+  autoRate: document.getElementById('autoRate'),
+  bits: document.getElementById('bits'),
+  hex: document.getElementById('hex'),
+  ascii: document.getElementById('ascii'),
+  diag: document.getElementById('diag'),
+  preambleView: document.getElementById('preambleView'),
+  payloadBitsView: document.getElementById('payloadBitsView'),
+  edgeCount: document.getElementById('edgeCount'),
+  edgeList: document.getElementById('edgeList'),
+  clearLock: document.getElementById('clearLock'),
+};
+els.preambleView.textContent = PREAMBLE_BITS;
+els.payloadBitsView.textContent = PAYLOAD_BITS.toString();
+
+let stream = null;
+let running = false;
+let roi = null; // {x,y,w,h} normalized (0~1)
+const ctxScope = els.scope.getContext('2d');
+
+async function listCams() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const vids = devices.filter(d => d.kind === 'videoinput');
+  els.camera.innerHTML = '';
+  vids.forEach((v,i) => {
+    const opt = document.createElement('option');
+    opt.value = v.deviceId;
+    opt.textContent = v.label || `Camera ${i+1}`;
+    els.camera.appendChild(opt);
+  });
+}
+
+async function startCam() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    alert('此瀏覽器不支援 getUserMedia。請用 Chrome / Edge / Safari，並確保 HTTPS。');
+    return;
+  }
+  const deviceId = els.camera.value || undefined;
+  const constraints = {
+    audio: false,
+    video: {
+      facingMode: 'environment',
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 60, max: 60 },
+      ...(deviceId ? { deviceId: { exact: deviceId } } : {})
+    }
+  };
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  els.video.srcObject = stream;
+  await els.video.play();
+
+  // 影片有尺寸後設定固定中心 ROI
+  if (USE_FIXED_ROI) setFixedROIFromVideo(els.video, FIXED_ROI_PX);
+  els.video.addEventListener('loadedmetadata', () => {
+    if (USE_FIXED_ROI) setFixedROIFromVideo(els.video, FIXED_ROI_PX);
+  }, { once: true });
+
+  fitOverlay();
+  running = true;
+  els.start.disabled = true;
+  els.stop.disabled = false;
+  processLoop();
+}
+
+function stopCam() {
+  running = false;
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  els.start.disabled = false;
+  els.stop.disabled = true;
+}
+
+function fitOverlay() {
+  const rect = els.video.getBoundingClientRect();
+  els.overlay.width = rect.width;
+  els.overlay.height = rect.height;
+  drawOverlay();
+}
+window.addEventListener('resize', fitOverlay);
+
+// ★ 依影片來源解析度，將中心 FIXED_ROI_PX×FIXED_ROI_PX 轉為 normalized ROI
+function setFixedROIFromVideo(video, boxPx = FIXED_ROI_PX) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+  const w = Math.min(boxPx, vw), h = Math.min(boxPx, vh);
+  const x = (vw - w) / 2;
+  const y = (vh - h) / 2;
+  roi = { x: x / vw, y: y / vh, w: w / vw, h: h / vh };
+  drawOverlay();
+}
+
+function drawOverlay() {
+  const octx = els.overlay.getContext('2d');
+  octx.clearRect(0,0,els.overlay.width,els.overlay.height);
+  if (roi) {
+    const rx = roi.x * els.overlay.width;
+    const ry = roi.y * els.overlay.height;
+    const rw = roi.w * els.overlay.width;
+    const rh = roi.h * els.overlay.height;
+    // 框線
+    octx.strokeStyle = '#22c55e';
+    octx.lineWidth = 2;
+    octx.strokeRect(rx, ry, rw, rh);
+    // 小標籤
+    const label = `固定 ROI ${Math.round(roi.w*els.video.videoWidth)}×${Math.round(roi.h*els.video.videoHeight)} px`;
+    const pad = 6;
+    const labelW = octx.measureText(label).width + pad*2;
+    const lx = Math.max(0, Math.min(rx, els.overlay.width - labelW));
+    const ly = Math.max(0, ry - 18);
+    octx.fillStyle = 'rgba(34,197,94,0.85)';
+    octx.fillRect(lx, ly, labelW, 16);
+    octx.fillStyle = 'white';
+    octx.font = '12px system-ui, sans-serif';
+    octx.fillText(label, lx + pad, ly + 12);
+  } else {
+    // 固定 ROI 版本不顯示拖拉提示
+  }
+}
+
+// 停用拖拉 ROI（固定 ROI 版本）
+(function enableRoiDrag() {
+  if (true) return;
+})();
+
+// ====== 訊號擷取 ======
+const buf = { t: [], y: [], maxSec: 8.5 };
+
+function pushSample(t, y) {
+  buf.t.push(t); buf.y.push(y);
+  while (buf.t.length && (t - buf.t[0] > buf.maxSec)) { buf.t.shift(); buf.y.shift(); }
+}
+
+function avgLumaFromROI(video) {
+  const w = 96, h = 54; // downsample for speed
+  const c = els.canvas;
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const vw = video.videoWidth, vh = video.videoHeight;
+  let sx=0, sy=0, sw=vw, sh=vh;
+  if (roi) {
+    sx = Math.round(roi.x * vw);
+    sy = Math.round(roi.y * vh);
+    sw = Math.max(8, Math.round(roi.w * vw));
+    sh = Math.max(8, Math.round(roi.h * vh));
+  }
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+  const img = ctx.getImageData(0,0,w,h).data;
+  let acc = 0;
+  for (let i=0;i<img.length;i+=4) acc += 0.2126*img[i] + 0.7152*img[i+1] + 0.0722*img[i+2]; // Y approx
+  return acc / (w*h*255); // 0..1
+}
+
+// ====== 門檻/工具 ======
+function adaptiveThreshold(yArr, tArr) {
+  if (yArr.length < 10) return 0.5;
+  const tEnd = tArr[tArr.length-1];
+  let i0 = tArr.length-1;
+  while (i0>0 && (tEnd - tArr[i0]) < 1.5) i0--;
+  const recent = yArr.slice(i0);
+  const sorted = [...recent].sort((a,b)=>a-b);
+  const p20 = sorted[Math.floor(sorted.length*0.20)] ?? 0.3;
+  const p80 = sorted[Math.floor(sorted.length*0.80)] ?? 0.7;
+  return (p20 + p80) / 2;
+}
+function avgFps(tArr) {
+  if (tArr.length<2) return 30;
+  const n = Math.min(120, tArr.length-1);
+  let acc=0;
+  for (let i=tArr.length-n;i<tArr.length-1;i++) acc += (tArr[i+1]-tArr[i]);
+  const dt = acc/Math.max(1,n-1);
+  return dt>0 ? 1/dt : 30;
+}
+function binarySearchTime(t, target){
+  let lo=0, hi=t.length-1;
+  if (target<=t[0]) return 0;
+  if (target>=t[hi]) return hi-1;
+  while (lo<=hi){
+    const mid=(lo+hi)>>1;
+    if (t[mid]===target) return Math.max(0, mid-1);
+    if (t[mid]<target) lo=mid+1; else hi=mid-1;
+  }
+  return Math.max(0, lo-1);
+}
+function sampleAt(y,t,ts){
+  const i = binarySearchTime(t, ts);
+  if (i<0 || i>=t.length-1) return y[Math.max(0, Math.min(y.length-1, i))]||0;
+  const a = (ts - t[i])/(t[i+1]-t[i] || 1e-6);
+  return y[i]*(1-a)+y[i+1]*a;
+}
+function avgBetween(y,t,ts0,ts1){
+  let i = binarySearchTime(t, ts0), sum=0, cnt=0;
+  while (i < t.length-1 && t[i] < ts1){
+    const a = Math.max(ts0, t[i]), b = Math.min(ts1, t[i+1]);
+    if (b>a){ sum += sampleAt(y,t,(a+b)/2); cnt++; }
+    i++;
+  }
+  return cnt? sum/cnt : sampleAt(y,t,(ts0+ts1)/2);
+}
+
+// ====== 斜率版邊緣偵測（dy/dt）======
+function findEdgesSlope(y, t, slopeHi=SLOPE_HI, slopeLo=SLOPE_LO, refractory=SLOPE_REFRACTORY) {
+  const edges = [];
+  let lastEdgeT = -1e9;
+  for (let i=1;i<y.length;i++){
+    const dt = Math.max(1e-3, t[i] - t[i-1]); // 避免除以零
+    const s  = (y[i] - y[i-1]) / dt;          // dy/dt（亮度/秒）
+    const ti = t[i];
+
+    // 上升緣
+    if (s >= slopeHi && (ti - lastEdgeT) >= refractory) {
+      edges.push({ t: ti, dir: +1 });
+      lastEdgeT = ti;
+      continue;
+    }
+    // 下降緣
+    if (s <= slopeLo && (ti - lastEdgeT) >= refractory) {
+      edges.push({ t: ti, dir: -1 });
+      lastEdgeT = ti;
+    }
+  }
+  return edges;
+}
+
+// ====== 速率估計（自動模式用）======
+function estimateSymbolPeriod(edges) {
+  if (!edges || edges.length<6) return null;
+  const intervals = [];
+  for (let i=1;i<edges.length;i++) intervals.push(edges[i].t - edges[i-1].t);
+  intervals.sort((a,b)=>a-b);
+  const core = intervals.slice(Math.floor(intervals.length*0.1), Math.ceil(intervals.length*0.9));
+  if (!core.length) return null;
+  const median = core[Math.floor(core.length/2)];
+  return median>0 ? median * (median>0.35 ? 1 : 2) : null; // 容忍 Tbit/2 峰
+}
+
+// ====== OOK 解碼（嚴格 preamble；支援 phase）======
+function decodeOOK(y, t, Tbit, preambleBits='10101010', payloadBits=8, phase=0) {
+  if (!Tbit || t.length<3) return null;
+
+  const t0 = t[0] + phase; // phase 由「邊緣鎖」或備援掃描決定
+  const bitsNeed = preambleBits.length + payloadBits + EXTRA_SEARCH_BITS; // 多抓一些以便搜尋
+  const thr = adaptiveThreshold(y, t);
+
+  const bits = [];
+  for (let k=0;k<bitsNeed;k++){
+    const s0 = t0 + k*Tbit + 0.2*Tbit; // 避開邊緣，取中段
+    const s1 = t0 + k*Tbit + 0.8*Tbit;
+    const m = avgBetween(y, t, s0, s1);
+    bits.push( m > thr ? '1' : '0' );
+  }
+  const bitStr = bits.join('');
+
+  // 嚴格：preamble 必須完全匹配（不容錯）
+  const pos = bitStr.indexOf(preambleBits);
+  if (pos === -1) return null;
+
+  const payload = bitStr.slice(pos + preambleBits.length,
+                               pos + preambleBits.length + payloadBits);
+  return { ok:true, bits: bitStr, payload, thr, pos, ham: 0 };
+}
+
+// ====== 相位掃描（備援用）======
+function tryDecodeWithPhase(yz, tz, Tbit) {
+  const fps = avgFps(tz);
+  let M = Math.round(Math.max(8, Math.min(24, fps * Tbit))); // 夾在 8~24
+  if (!Number.isFinite(M) || M<8) M = 12;
+
+  let best=null, bestPos=Infinity, bestPhase=0;
+  for (let m=0; m<M; m++){
+    const phase = (m/M)*Tbit;
+    const r = decodeOOK(yz, tz, Tbit, PREAMBLE_BITS, PAYLOAD_BITS, phase);
+    if (!r) continue;
+    if (r.pos < bestPos) { best=r; bestPos=r.pos; bestPhase=phase; }
+  }
+  if (best) return { ...best, phase: bestPhase };
+  return null;
+}
+
+// 視覺化（含邊緣▲▼）
+function drawScope(t, y, thr, edges = []) {
+  const w = els.scope.width, h = els.scope.height;
+  const ctx = ctxScope;
+  ctx.clearRect(0,0,w,h);
+
+  // 中線
+  ctx.strokeStyle = '#e5e7eb';
+  ctx.beginPath(); ctx.moveTo(0, h*0.5); ctx.lineTo(w, h*0.5); ctx.stroke();
+
+  if (t.length < 2) return;
+  const tmin = t[0], tmax = t[t.length-1];
+  const sx = x => ((x - tmin) / (tmax - tmin)) * w;
+  const sy = v => h - v*(h-6) - 3;
+
+  // 亮度曲線
+  ctx.beginPath();
+  for (let i=0;i<y.length;i++){
+    const x = sx(t[i]), yy = sy(y[i]);
+    if (i===0) ctx.moveTo(x,yy); else ctx.lineTo(x,yy);
+  }
+  ctx.strokeStyle = '#111827';
+  ctx.lineWidth = 1.25; ctx.stroke();
+
+  // 門檻線（視覺用）
+  ctx.strokeStyle = '#9ca3af';
+  ctx.setLineDash([6,4]);
+  const thY = sy(thr);
+  ctx.beginPath(); ctx.moveTo(0, thY); ctx.lineTo(w, thY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 邊緣標記：上升用綠色▲，下降用紅色▼（畫在門檻上）
+  ctx.fillStyle = '#10b981';
+  for (const e of edges) {
+    if (e.dir > 0) {
+      const x = sx(e.t);
+      ctx.beginPath();
+      ctx.moveTo(x, thY - 8);
+      ctx.lineTo(x - 5, thY);
+      ctx.lineTo(x + 5, thY);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  ctx.fillStyle = '#ef4444';
+  for (const e of edges) {
+    if (e.dir < 0) {
+      const x = sx(e.t);
+      ctx.beginPath();
+      ctx.moveTo(x, thY + 8);
+      ctx.lineTo(x - 5, thY);
+      ctx.lineTo(x + 5, thY);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+}
+
+// 渲染最近 N 個邊緣的小面板
+function renderEdgePanel(edges, Tbit) {
+  const N = Math.max(1, Math.min(200, parseInt(els.edgeCount.value)||12));
+  const latest = edges.slice(-N).sort((a,b)=> b.t - a.t); // 新→舊
+  let html = '';
+  html += `<div class="row hdr"><div>#</div><div>t (s)</div><div>Δt (ms)</div><div>型態</div><div>相位 φ</div></div>`;
+  for (let i=0; i<latest.length; i++){
+    const e = latest[i];
+    const prev = latest[i+1];
+    const dtms = prev ? ((e.t - prev.t)*1000) : NaN;
+    const type = e.dir > 0 ? '▲' : '▼';
+    let phiTxt = '—';
+    if (lockedT0 != null && Number.isFinite(Tbit) && Tbit>0){
+      const phi = mod(e.t - lockedT0, Tbit) / Tbit * 360;
+      phiTxt = `${phi.toFixed(0)}°`;
+    }
+    html += `<div class="row"><div>${i+1}</div><div>${e.t.toFixed(3)}</div><div>${isNaN(dtms)?'—':dtms.toFixed(1)}</div><div>${type}</div><div>${phiTxt}</div></div>`;
+  }
+  els.edgeList.innerHTML = html;
+}
+
+// 主迴圈（邊緣鎖相位優先；失敗久→解鎖；必要時相位掃描備援）
+async function processLoop(){
+  const startTime = performance.now();
+  const useRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+  const tick = (_now, metadata) => {
+    if (!running) return;
+    const tSec = metadata?.mediaTime ?? ((performance.now() - startTime)/1000);
+    const y = avgLumaFromROI(els.video);
+    pushSample(tSec, y);
+
+    const thr = adaptiveThreshold(buf.y, buf.t);
+
+    // ★ 用斜率偵測邊緣
+    const edges = findEdgesSlope(buf.y, buf.t, SLOPE_HI, SLOPE_LO, SLOPE_REFRACTORY);
+    drawScope(buf.t, buf.y, thr, edges);
+
+    // Tbit
+    let Tbit = null;
+    if (els.autoRate.checked) {
+      // 用斜率邊緣估符元期
+      Tbit = estimateSymbolPeriod(edges);
+    } else {
+      const R = parseFloat(els.symRate.value)||2;
+      Tbit = 1.0 / R;
+    }
+
+    // 更新「最近邊緣」小面板
+    renderEdgePanel(edges, Tbit);
+
+    // 以 preamble+payload 長度決定視窗大小（再加 guard）
+    let result = null, phaseUsed = 0, locked = (lockedT0 != null);
+    if (Tbit && buf.t.length>10) {
+      // const needSec = (PREAMBLE_BITS.length + PAYLOAD_BITS) * Tbit + 0.5; // guard 0.5s
+      // const t = buf.t;
+      // let i0 = t.length-1;
+      // while (i0>0 && (t[t.length-1] - t[i0]) < needSec) i0--;
+      // const tz = buf.t.slice(i0), yz = buf.y.slice(i0);
+      const tz = buf.t, yz = buf.y;
+
+      // 邊緣鎖相位：用 lockedT0 或最新邊緣求 phase
+      if (lockedT0 != null) {
+        phaseUsed = mod(lockedT0 - tz[0], Tbit);
+        result = decodeOOK(yz, tz, Tbit, PREAMBLE_BITS, PAYLOAD_BITS, phaseUsed);
+      } else if (edges.length) {
+        const edgeT = edges[edges.length - 1].t;
+        phaseUsed = mod(edgeT - tz[0], Tbit);
+        result = decodeOOK(yz, tz, Tbit, PREAMBLE_BITS, PAYLOAD_BITS, phaseUsed);
+      }
+
+      // 若還是沒成功，作為備援跑相位掃描
+      // if (!result) {
+      //   const fallback = tryDecodeWithPhase(yz, tz, Tbit);
+      //   if (fallback) { result = fallback; phaseUsed = fallback.phase; locked = false; }
+      // }
+
+      // 成功就鎖定 t0 在「preamble 開始」
+      if (result) {
+        const t0Abs = tz[0] + phaseUsed;
+        lockedT0 = t0Abs + result.pos * Tbit; // pos：preamble 在 bit 串中的起點索引
+        failCount = 0;
+      } else {
+        failCount++;
+        if (failCount > 30) { lockedT0 = null; failCount = 0; } // ~1秒後解鎖（依 FPS 調整）
+      }
+    }
+
+    // 診斷資訊
+    if (result) {
+      els.bits.textContent  = result.payload;
+      els.hex.textContent   = bitsToHex(result.payload);
+      els.ascii.textContent = bitsToAscii(result.payload);
+      els.diag.textContent  = `OOK | ${locked?'LOCKED':'SCAN'} | edges:${edges.length} | Tbit≈${Tbit?.toFixed(3)}s, Thr≈${(result.thr??thr).toFixed(3)}, Phase≈${(phaseUsed/Tbit*360).toFixed(0)}°, pos=${result.pos}, FPS≈${avgFps(buf.t).toFixed(1)}`;
+    } else {
+      els.diag.textContent  = `解碼中… OOK | ${lockedT0!=null?'LOCKED':'UNLOCKED'} | edges:${edges.length} | Tbit≈${Tbit?Tbit.toFixed(3):'N/A'}s, Thr≈${thr.toFixed(3)}, FPS≈${avgFps(buf.t).toFixed(1)}`;
+    }
+
+    if (useRVFC) els.video.requestVideoFrameCallback(tick);
+    else requestAnimationFrame(tick); // 乾淨的 fallback
+  };
+
+  if (useRVFC) els.video.requestVideoFrameCallback(tick);
+  else requestAnimationFrame(tick);
+}
+
+// 小工具
+function bitsToHex(bits) {
+  const out=[];
+  for (let i=0;i<bits.length;i+=8){
+    const b = bits.slice(i,i+8);
+    if (b.length<8) break;
+    out.push(parseInt(b,2).toString(16).padStart(2,'0').toUpperCase());
+  }
+  return out.join(' ');
+}
+function bitsToAscii(bits){
+  let s='';
+  for (let i=0;i<bits.length;i+=8){
+    const b=bits.slice(i,i+8);
+    if (b.length<8) break;
+    const code=parseInt(b,2);
+    s += (code>=32 && code<=126)? String.fromCharCode(code) : '·';
+  }
+  return s;
+}
+
+// 綁定 UI
+els.start.addEventListener('click', startCam);
+els.stop.addEventListener('click', stopCam);
+els.clearLock.addEventListener('click', ()=>{ lockedT0=null; failCount=0; });
+els.edgeCount.addEventListener('change', ()=>{ /* 由 tick 重新渲染 */ });
+navigator.mediaDevices?.enumerateDevices && listCams();
+</script>
+</body>
+</html>

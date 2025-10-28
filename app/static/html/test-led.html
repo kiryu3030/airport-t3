@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>VLC OOK Decoder (4Hz, Edge-Sync)</title>
+<style>
+  :root{font-family:system-ui,Segoe UI,Roboto,Noto Sans,Arial,sans-serif}
+  body{margin:0;padding:16px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  video,canvas{max-width:100%;border:1px solid #ddd;border-radius:12px}
+  button,input{padding:10px 14px;border-radius:10px;border:1px solid #ccc;background:#fff}
+  #log{white-space:pre-wrap;background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:8px;min-height:7em}
+  .hud{position:relative;display:inline-block}
+  .roi{position:absolute;border:2px dashed #06c;inset:calc(50% - 50px) calc(50% - 50px) auto auto;width:100px;height:100px;pointer-events:none}
+  small{color:#666}
+</style>
+</head>
+<body>
+<h2>可見光 OOK 解碼（4 Hz，邊緣同步版）</h2>
+
+<div class="row">
+  <label>ROI 邊長(px)：<input type="number" id="roi" value="100" min="20" max="280"></label>
+  <label>Payload 位數：<input type="number" id="payloadBits" value="8" min="1" max="128"></label>
+  <button id="startBtn">啟動相機</button>
+  <button id="stopBtn" disabled>停止</button>
+  <button id="torchBtn" disabled>手電筒</button>
+</div>
+<small>以 HTTPS 或 http://localhost 開啟；避免在 App 內嵌瀏覽器（LINE/IG 等）。</small>
+
+<div class="row" style="margin-top:12px">
+  <div class="hud">
+    <video id="v" playsinline muted></video>
+    <div class="roi" id="roiBox"></div>
+  </div>
+  <canvas id="c" width="320" height="240" hidden></canvas>
+</div>
+
+<h3>狀態</h3>
+<div id="log">尚未開始</div>
+
+<script>
+const PREAMBLE = "10101010";     // 與發送端一致
+const MAX_SEC = 5.0;             // 亮度緩衝保留最近 N 秒
+const MIN_SAMPLES = 60;          // 起碼收集一些點再解碼
+const EDGE_DECODE_INTERVAL = 120; // 每 120ms 嘗試解碼一次
+
+const v = document.getElementById('v');
+const c = document.getElementById('c');
+const ctx = c.getContext('2d', { willReadFrequently: true });
+const roiEl = document.getElementById('roi');
+const payloadBitsEl = document.getElementById('payloadBits');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const torchBtn = document.getElementById('torchBtn');
+const logEl = document.getElementById('log');
+
+let stream, track, imageCapture;
+let running = false;
+let decodeTimer = null;
+
+// 亮度/時間緩衝
+const lumBuf = [];
+const timeBuf = [];
+
+function log(msg){ logEl.textContent = msg; }
+
+function pushSample(t, y){
+  lumBuf.push(y); timeBuf.push(t);
+  while (timeBuf.length && (timeBuf[timeBuf.length-1] - timeBuf[0] > MAX_SEC)) {
+    lumBuf.shift(); timeBuf.shift();
+  }
+}
+
+function median(arr){
+  if (!arr.length) return 0;
+  const a = arr.slice().sort((x,y)=>x-y);
+  const m = Math.floor(a.length/2);
+  return (a.length % 2) ? a[m] : (a[m-1] + a[m]) / 2;
+}
+
+// 讀取 ROI 平均亮度
+function readROILuma(){
+  if (!v.videoWidth || !v.videoHeight) return null;
+  const W = c.width = v.videoWidth;
+  const H = c.height = v.videoHeight;
+  ctx.drawImage(v, 0, 0, W, H);
+  const side = Math.min(Number(roiEl.value)||100, Math.min(W,H));
+  const x0 = (W - side) >> 1;
+  const y0 = (H - side) >> 1;
+  const data = ctx.getImageData(x0, y0, side, side).data;
+  let sum=0;
+  for (let i=0;i<data.length;i+=4){
+    sum += 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+  }
+  return sum/(side*side);
+}
+
+// —— Edge-based 解碼：從亮度 + 時間找邊緣 → 估 bit 寬 → 等距取樣 —— //
+function decodeOOK_byEdges(lumArr, timeArr, preambleStr, expectedPayloadBits) {
+  if (lumArr.length < MIN_SAMPLES) return null;
+
+  // 1) 門檻二值化（中位數）
+  const med = median(lumArr);
+  const bin = lumArr.map(y => y > med ? 1 : 0);
+
+  // 2) 抓邊緣時間（線性插值到門檻點）
+  const edges = [];
+  for (let i = 1; i < bin.length; i++) {
+    if (bin[i] !== bin[i-1]) {
+      const t0 = timeArr[i-1], t1 = timeArr[i];
+      const v0 = lumArr[i-1], v1 = lumArr[i];
+      const denom = (v1 - v0);
+      const ratio = (denom === 0) ? 0.5 : (med - v0) / denom;
+      const tEdge = t0 + (t1 - t0) * Math.max(0, Math.min(1, ratio));
+      edges.push(tEdge);
+    }
+  }
+  if (edges.length < 4) return null;
+
+  // 3) 用邊緣間隔估 bitDuration（取中位）
+  const intervals = [];
+  for (let i = 1; i < edges.length; i++) intervals.push(edges[i] - edges[i-1]);
+  intervals.sort((a,b)=>a-b);
+  const half = Math.floor(intervals.length/2);
+  const bitEst = (intervals.length % 2) ? intervals[half] : (intervals[half-1]+intervals[half])/2;
+
+  // bitEst 若太小/太大（異常），就放棄
+  if (!(bitEst > 0.05 && bitEst < 1.0)) return null; // 50ms~1s 安全帶
+
+  // 4) 以最後一個 edge 當相位基準，往後等距採樣
+  const lastEdge = edges[edges.length - 1];
+  const totalBitsToTry = preambleStr.length + expectedPayloadBits + 10; // 留點餘裕
+  const sampleTimes = [];
+  for (let i = 1; i <= totalBitsToTry; i++) {
+    // 在 bit 中央取樣，可避開轉換邊界
+    sampleTimes.push(lastEdge + (i - 0.5) * bitEst);
+  }
+
+  // 5) 取樣並轉為 0/1
+  const sampledBits = sampleTimes.map(st => {
+    // 二分找最近時間點
+    let lo = 0, hi = timeArr.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (timeArr[mid] < st) lo = mid + 1; else hi = mid;
+    }
+    const idx = Math.max(0, Math.min(timeArr.length - 1, lo));
+    return (lumArr[idx] > med) ? 1 : 0;
+  });
+
+  // 6) 找 preamble → 取 payload
+  const bitStr = sampledBits.join('');
+  const idx = bitStr.indexOf(preambleStr);
+  if (idx === -1) return null;
+  if (idx + preambleStr.length + expectedPayloadBits > sampledBits.length) return null;
+
+  const payloadBits = sampledBits
+    .slice(idx + preambleStr.length, idx + preambleStr.length + expectedPayloadBits)
+    .join('');
+  return { payloadBits, bitSec: bitEst };
+}
+
+// —— 相機啟動/停止 —— //
+async function start(){
+  if (!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)) {
+    alert('此環境不支援相機：請使用 HTTPS（或 http://localhost），並用 Chrome/Firefox 開啟。');
+    return;
+  }
+  if (!isSecureContext && location.hostname !== 'localhost') {
+    alert('需在 HTTPS 或 http://localhost 下開啟才能使用相機。');
+    return;
+  }
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        frameRate: { ideal: 60, max: 60 },
+        width: { ideal: 1280 }, height: { ideal: 720 }
+      },
+      audio: false
+    });
+  } catch (e) {
+    console.error(e);
+    alert('開啟相機失敗：' + e.name + '\n請確認權限與瀏覽器/HTTPS。');
+    return;
+  }
+
+  v.srcObject = stream;
+  await v.play();
+  track = stream.getVideoTracks()[0];
+
+  // 試著開啟手電筒控制
+  try {
+    imageCapture = new ImageCapture(track);
+    const caps = track.getCapabilities?.();
+    if (caps && 'torch' in caps) torchBtn.disabled = false;
+  } catch { torchBtn.disabled = true; }
+
+  running = true;
+  startBtn.disabled = true; stopBtn.disabled = false;
+
+  log(`相機啟動… 請把 LED 對準中央 ROI。等待前導碼 ${PREAMBLE}。`);
+
+  // 以每個影格更新亮度緩衝
+  const pump = () => {
+    if (!running) return;
+    const y = readROILuma();
+    if (y != null) pushSample(performance.now()/1000, y);
+    v.requestVideoFrameCallback(pump);
+  };
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    v.requestVideoFrameCallback(pump);
+  } else {
+    (function loop(){
+      if (!running) return;
+      const y = readROILuma();
+      if (y != null) pushSample(performance.now()/1000, y);
+      requestAnimationFrame(loop);
+    })();
+  }
+
+  // 週期性嘗試解碼（edge-based）
+  decodeTimer = setInterval(()=>{
+    if (!running || timeBuf.length < MIN_SAMPLES) return;
+    const payloadLen = Number(payloadBitsEl.value || 8);
+    const res = decodeOOK_byEdges(lumBuf, timeBuf, PREAMBLE, payloadLen);
+    if (res && res.payloadBits) {
+      const bits = res.payloadBits;
+      const val = parseInt(bits, 2);
+      const ascii = (payloadLen === 8 && val >= 32 && val <= 126) ? String.fromCharCode(val) : '';
+      log(
+        `解碼成功！\n` +
+        `preamble=${PREAMBLE}\n` +
+        `payload(bits)=${bits}\n` +
+        `payload(dec)=${isNaN(val)?'N/A':val}${ascii?`  '${ascii}'`:''}\n` +
+        `估計位元時間 ≈ ${(res.bitSec*1000).toFixed(1)} ms`
+      );
+      // 成功後清掉舊資料一部分，避免連續重複觸發
+      lumBuf.splice(0, Math.max(0, lumBuf.length - 100));
+      timeBuf.splice(0, Math.max(0, timeBuf.length - 100));
+    }
+  }, EDGE_DECODE_INTERVAL);
+
+}
+
+function stop(){
+  running = false;
+  startBtn.disabled = false; stopBtn.disabled = true; torchBtn.disabled = true;
+  if (decodeTimer){ clearInterval(decodeTimer); decodeTimer = null; }
+  if (stream){ stream.getTracks().forEach(t=>t.stop()); }
+  stream = null; track = null; imageCapture = null;
+  log('已停止。');
+}
+
+torchBtn.addEventListener('click', async ()=>{
+  if (!track) return;
+  try {
+    const caps = track.getCapabilities?.();
+    if (caps && 'torch' in caps) {
+      const cur = track.getSettings?.().torch;
+      await track.applyConstraints({ advanced: [{ torch: !cur }]});
+    }
+  } catch(e){ console.warn(e); }
+});
+
+startBtn.addEventListener('click', start);
+stopBtn.addEventListener('click', stop);
+</script>
+</body>
+</html>
