@@ -16,7 +16,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.use('/treasure-radio/app/static', express.static(path.join(__dirname, 'static')));
+app.use('/static', express.static(path.join(__dirname, 'static')));
 
 app.use(apiRoute);
 app.use(htmlRoute);
@@ -26,9 +26,9 @@ app.use(errorHandler);
 const mainApp = createServer(app);
 const io = new Server(mainApp, {cors: {origin: "*" }});
 
-const WebSocket = require('./routes/websocket/websocket-event.js');
-WebSocket.init(io);
-WebSocket.mountEvent();
+// const WebSocket = require('./routes/websocket/websocket-event.js');
+// WebSocket.init(io);
+// WebSocket.mountEvent();
 
 // export default mainApp;
 module.exports = mainApp;

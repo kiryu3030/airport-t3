@@ -80,21 +80,23 @@ class RS485Port {
   }
 }
 
-let stepperPort1 = new RS485Port('COM3', 38400);
+module.exports = RS485Port;
 
-stepperPort1.setErrorHandler((err)=>{
-  try {
-    logging.info('Stepper1Error: ', err.message);
-  } catch (error) {
-    logging.error(error);
-  }
-});
+// let stepperPort1 = new RS485Port('COM3', 38400);
 
-const RS485 = {
-  stepperPort1: stepperPort1,
-  open: () => {
-    stepperPort1.open();
-  },
-}
+// stepperPort1.setErrorHandler((err)=>{
+//   try {
+//     logging.info('Stepper1Error: ', err.message);
+//   } catch (error) {
+//     logging.error(error);
+//   }
+// });
 
-module.exports = RS485;
+// const RS485 = {
+//   stepperPort1: stepperPort1,
+//   open: () => {
+//     stepperPort1.open();
+//   },
+// }
+
+// module.exports = RS485;

@@ -73,7 +73,7 @@ class stepperCMD {
   }
 }
 
-export default stepperCMD;
+module.exports = stepperCMD;
 
 // class stepperCMD {
 //   /**

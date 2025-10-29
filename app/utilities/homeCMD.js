@@ -41,7 +41,7 @@ class homeCMD {
   }
 }
 
-export default homeCMD;
+module.exports = homeCMD;
 
 // class stepperCMD {
 //   /**
