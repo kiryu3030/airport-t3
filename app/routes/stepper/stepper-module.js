@@ -24,14 +24,37 @@ class ScreenModule {
       await this.RS485.write(new homeCMD(1).buf);
       await this.RS485.write(new homeCMD(2).buf);
       await this.RS485.write(new homeCMD(3).buf);
-      await sleep(15000);
+      await sleep(6000);
       console.log("運轉中...");
       // 步進馬達參數
-      let targetRun = 2.0; // 1秒內轉360度
+      let targetRun = 1.2; // 1秒內轉360度
       let pulse57 = 0.036/50.0;
 
+      await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 40).buf);
+	  await this.RS485.write(new stepperCMD(2, 1, pulse57, targetRun, 40).buf);
+	  await this.RS485.write(new stepperCMD(3, 1, pulse57, targetRun, 40).buf);
+	  await sleep(5500);
       await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 10).buf);
-      
+	  for(let i=0;i<3;i++){
+		  await sleep(4100);
+		  await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 40).buf);
+		  await this.RS485.write(new stepperCMD(2, 1, pulse57, targetRun, 10).buf);
+		  await sleep(4100);
+		  await this.RS485.write(new stepperCMD(2, 1, pulse57, targetRun, 40).buf);
+		  await this.RS485.write(new stepperCMD(3, 1, pulse57, targetRun, 10).buf);
+		  await sleep(4100);
+		  await this.RS485.write(new stepperCMD(3, 1, pulse57, targetRun, 40).buf);
+		  await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 10).buf);
+	  }
+	  await sleep(4100);
+	  await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 40).buf);
+	  await sleep(4100);
+	  await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 0).buf);
+	  await this.RS485.write(new stepperCMD(2, 1, pulse57, targetRun, 0).buf);
+	  await this.RS485.write(new stepperCMD(3, 1, pulse57, targetRun, 0).buf);
+	  await sleep(5500);
+	  
+	  
 
     } catch (error) {
       logging.error(error);
