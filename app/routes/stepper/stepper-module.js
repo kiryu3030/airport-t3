@@ -14,11 +14,11 @@ class ScreenModule {
 
   async init() {
     this.RS485.open();
-    await sleep(2);
   }
   
   async outputDemo() {
     try {
+      await sleep(3000);
       if(!this.RS485.isOpen) return;
       console.log("運轉中...");
       // 步進馬達參數
