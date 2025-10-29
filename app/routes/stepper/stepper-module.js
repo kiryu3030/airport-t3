@@ -20,12 +20,17 @@ class ScreenModule {
     try {
       await sleep(3000);
       if(!this.RS485.isOpen) return;
+      console.log("回限位...");
+      await this.RS485.write(new homeCMD(1).buf);
+      await this.RS485.write(new homeCMD(2).buf);
+      await this.RS485.write(new homeCMD(3).buf);
+      await sleep(15000);
       console.log("運轉中...");
       // 步進馬達參數
       let targetRun = 2.0; // 1秒內轉360度
       let pulse57 = 0.036/50.0;
 
-      await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 5, 5).buf);
+      await this.RS485.write(new stepperCMD(1, 1, pulse57, targetRun, 10).buf);
       
 
     } catch (error) {

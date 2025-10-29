@@ -7,7 +7,7 @@ class stepperCMD {
    * @param {Number} runTime runTime
    * @param {Number} angle angle
    */
-  constructor(id, mode, pulse, runTime, angle, lastPos, addRunTime = true) {
+  constructor(id, mode, pulse, runTime, angle, addRunTime = true) {
     this.id = id;
     this.mode = mode;
     this.pos = Math.round(angle / pulse);
