@@ -54,7 +54,14 @@ class ScreenModule {
         await this.RS485.write(new stepperCMD(2, 1, pulse57, targetRun, 0).buf);
         await this.RS485.write(new stepperCMD(3, 1, pulse57, targetRun, 0).buf);
         await sleep(5500);
-        await sleep(3000);
+        await sleep(1000);
+
+        console.log("回限位...");
+        await this.RS485.write(new homeCMD(1).buf);
+        await this.RS485.write(new homeCMD(2).buf);
+        await this.RS485.write(new homeCMD(3).buf);
+        await sleep(6000);
+        console.log("運轉中...");
       }
       
 	  
