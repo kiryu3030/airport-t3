@@ -14,10 +14,10 @@ class stepperCMD {
     this.speed = this.calSpeed(pulse, runTime, 0.1);
     this.rpm = Math.round(pulse/360.0*this.speed*60.0);
     this.accrpm = this.calAccDecRPM(this.rpm, 0.3);
-    console.log(this.pos);
+    // console.log(this.pos);
     // console.log(this.speed);
-    console.log(this.rpm);
-    console.log(this.accrpm);
+    // console.log(this.rpm);
+    // console.log(this.accrpm);
     // this.acc = this.rpm;
     // this.dec = this.rpm;
 

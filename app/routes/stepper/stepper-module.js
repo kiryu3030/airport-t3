@@ -60,7 +60,7 @@ class ScreenModule {
         await this.RS485.write(new homeCMD(1).buf);
         await this.RS485.write(new homeCMD(2).buf);
         await this.RS485.write(new homeCMD(3).buf);
-        await sleep(6000);
+        await sleep(5000);
         console.log("運轉中...");
       }
       
