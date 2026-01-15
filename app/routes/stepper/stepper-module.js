@@ -61,7 +61,7 @@ class ScreenModule {
 	  
 
     } catch (error) {
-      logging.error(error);
+      console.error(error);
     }
   }
 

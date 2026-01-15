@@ -13,9 +13,11 @@ class stepperCMD {
     this.pos = Math.round(angle / pulse);
     this.speed = this.calSpeed(pulse, runTime, 0.1);
     this.rpm = Math.round(pulse/360.0*this.speed*60.0);
+    this.accrpm = this.calAccDecRPM(this.rpm, 0.3);
     console.log(this.pos);
     // console.log(this.speed);
-    // console.log(this.rpm);
+    console.log(this.rpm);
+    console.log(this.accrpm);
     // this.acc = this.rpm;
     // this.dec = this.rpm;
 
@@ -28,8 +30,8 @@ class stepperCMD {
     this.cmd.writeUint16BE(mode, 7); //2 mode
     this.cmd.writeInt32BE(this.pos, 9); //4 pos
     this.cmd.writeUint16BE(this.rpm, 13); //2 speed
-    this.cmd.writeUint16BE(this.rpm, 15); //2 acc
-    this.cmd.writeUint16BE(this.rpm, 17); //2 acc
+    this.cmd.writeUint16BE(this.accrpm, 15); //2 acc
+    this.cmd.writeUint16BE(this.accrpm, 17); //2 acc
     this.cmd.writeUint16BE(0, 19); //2 delay time
     this.cmd.writeUint16BE(16, 21); //2 trigger
     let crc = this.crc16(this.cmd);
@@ -42,10 +44,10 @@ class stepperCMD {
     return  Math.round((A-initTime*stepperAdTime)/(stepperRunTime-stepperAdTime));
   }
 
-  calAccDec(speed, stepperRunTime, stepperAdTime) {
+  calAccDecRPM(speed, stepperAdTime) {
     let initTime = 0;
-    let acc = (1000.0*stepperAdTime)/((speed-initTime)/1000.0);
-    acc = Math.round(acc*1000.0)/1000.0;
+    let acc = (1000.0*stepperAdTime)/speed;
+    acc = Math.round(acc);
     return acc;
   }
 
