@@ -9,7 +9,7 @@ const { Demo_1, Demo_2 } = require('./app/services/demo-1.js');
 // const screen_1 = new ScreenModule(new RS485Port('COM3', 38400));
 
 // const driver = new DM2JDriver(new RS485Port('COM3', 115200), { step: 0.036 , gr: 50.0});
-const driver = new ZDT_X42SModule(new RS485Port('COM103', 115200), { step: 1.8 , gr: 50.0});
+const driver = new ZDT_X42SModule(new RS485Port('COM3', 115200), { step: 1.8 , gr: 50.0});
 driver.init();
 
 // const demo1 = new Demo_1(driver);

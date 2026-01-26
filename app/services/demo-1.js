@@ -73,7 +73,7 @@ class Demo_2 {
       let targetRun = 1.2;
       let pulse57 = 1.8;
 
-      for(let j=0;j<100;j++){
+      while(true){
         await this.driver.move({id:1, mode:1, runTime:targetRun, angle:40});
         await this.driver.move({id:2, mode:1, runTime:targetRun, angle:40});
         await this.driver.move({id:3, mode:1, runTime:targetRun, angle:40});
@@ -101,7 +101,7 @@ class Demo_2 {
 
         console.log("回限位...");
         await this.driver.home([1,2,3]);
-        await sleep(5000);
+        await sleep(6000);
         console.log("運轉中...");
       }
       
