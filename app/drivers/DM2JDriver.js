@@ -1,19 +1,40 @@
-const RS485 = require('../../serial/rs485.js');
-const stepperCMD  = require('../../utilities/stepperCMD.js');
-const homeCMD  = require('../../utilities/homeCMD.js');
-const { sleep } = require('../../utilities/utils.js');
+const Driver = require('./driver.js');
+const RS485 = require('../serial/rs485.js');
+const stepperCMD  = require('../utilities/stepperCMD.js');
+const homeCMD  = require('../utilities/homeCMD.js');
+const { sleep } = require('../utilities/utils.js');
 
-class ScreenModule {
+/**
+ * 控制DM2J 系列驅控一體成型步進驅動器
+ */
+class DM2JDriver extends Driver {
   /**
-   * Insert a car
-   * @param {RS485} RS485 
+   * @param {RS485} rs485 
    */
-  constructor(RS485) {
-    this.RS485 = RS485;
+  constructor(rs485, { step = 0.036, gr = 50.0 } = {}) {
+    super();
+    this.rs485 = rs485;
+    this.step = step;
+    this.gr = gr;
+    this.pulse = step/gr;
   }
 
   async init() {
-    this.RS485.open();
+    this.rs485.open();
+  }
+
+  async home(ids) {
+    for (const id of ids) {
+      await this.rs485.write(new homeCMD(id).buf);
+    }
+  }
+
+  async move({ id, mode, runTime, angle }) {
+    await this.rs485.write(new stepperCMD(id, mode, this.pulse, runTime, angle).buf);
+  }
+
+  get isOpen() {
+    return this.rs485.isOpen;
   }
   
   async outputDemo() {
@@ -74,4 +95,4 @@ class ScreenModule {
 
 }
 
-module.exports = ScreenModule;
+module.exports = DM2JDriver;
