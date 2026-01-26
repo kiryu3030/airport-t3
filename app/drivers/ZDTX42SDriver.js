@@ -29,7 +29,8 @@ class ZDT_X42SModule extends Driver {
   }
 
   async move({ id, mode, runTime, angle }) {
-    await this.rs485.write(new stepperCMD(id, mode, this.pulse, runTime, angle).buf);
+    const pos = Math.round(angle * this.gr);
+    await this.rs485.write(new stepperCMD(id, mode, this.pulse, runTime, pos).buf);
   }
 
   get isOpen() {
